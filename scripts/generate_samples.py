@@ -302,6 +302,10 @@ def main() -> None:
         alt_inv = inv.replace("-", " ")  # "INV 20xxx" – normalizes to same
         _make_invoice_pdf(inv_path_b, supplier, alt_inv, d, po, base, tax, total)
 
+        # Matching PO so both submissions are full pairs (first → Approve, second → Duplicate).
+        # Not added to `records`, so the 20-row test sheet is unchanged.
+        _make_po_pdf(SAMPLES_DIR / f"po_{i:03d}_dup.pdf", supplier, po, d, total)
+
         records.append({
             "file": inv_path_a.name, "doc_type": "supplier_invoice",
             "supplier_name": supplier, "invoice_number": inv,

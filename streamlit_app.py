@@ -9,7 +9,9 @@ import time
 import httpx
 import streamlit as st
 
-API_URL = "http://localhost:8000/v1/extract"
+import os
+
+API_URL = os.environ.get("VANTAGE_API_URL", "http://localhost:8000/v1/extract")
 
 st.set_page_config(
     page_title="Vantage Retail · OCR Connector",
@@ -52,9 +54,16 @@ if run and file1 is not None:
         except httpx.ConnectError:
             st.error("❌ Could not connect to the API. Is the FastAPI server running on port 8000?")
             st.stop()
+        except httpx.TimeoutException:
+            st.error("❌ The API took too long to respond. Try again.")
+            st.stop()
 
     if resp.status_code != 200:
-        st.error(f"❌ {resp.status_code}: {resp.json().get('detail', 'Unknown error')}")
+        try:
+            detail = resp.json().get("detail", "Unknown error")
+        except ValueError:
+            detail = "Unknown error"
+        st.error(f"❌ {resp.status_code}: {detail}")
         st.stop()
 
     data = resp.json()

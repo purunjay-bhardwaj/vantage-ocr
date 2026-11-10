@@ -54,7 +54,21 @@ Content-Type: multipart/form-data
 
 file1  (required) — PDF, PNG, or JPEG
 file2  (optional) — paired document for pair check
+
+GET /health          — liveness probe → {"status": "ok"}
 ```
+
+### Error responses
+
+All error bodies are fixed strings — they never echo document content.
+
+| HTTP | When | `detail` |
+|------|------|----------|
+| 400 | Empty file or not PDF/PNG/JPEG (magic-byte check) | `Could not read this document.` |
+| 413 | File over `MAX_UPLOAD_BYTES` | `File is larger than the 10 MB limit.` |
+| 422 | OCR found no text, or the model reply failed schema validation | `Could not read this document.` |
+| 502 | LLM provider unreachable / auth / rate limit / timeout | `Extraction service unavailable. Try again.` |
+| 500 | Anything unexpected | `Internal error while processing the document.` |
 
 ### Response
 
@@ -104,13 +118,17 @@ The same rule is applied at both storage time and lookup time, so `INV-20411` an
 
 ## Status logic
 
+Evaluated in this order — first match wins:
+
 | Status | When |
 |--------|------|
-| **Duplicate** | Normalized invoice number already in the local SQLite store. Wins over all other statuses. |
+| **Not applicable** | Every uploaded file is a payment receipt. |
+| **Duplicate** | Normalized invoice number already in the local SQLite store. Wins over all other statuses (including a missing PO). |
 | **Approve** | Totals match to the paisa (2 decimal places) and invoice is new. |
 | **Hold** | Totals differ by any amount and invoice is new. Even a 1-paisa gap is a Hold. |
-| **Incomplete** | Invoice or purchase order is missing from the uploaded files. |
-| **Not applicable** | The only file uploaded is a payment receipt. |
+| **Incomplete** | Invoice or purchase order is missing, or a total could not be read. |
+
+An invoice number is **recorded only after a full check (Approve or Hold)**. Uploading an invoice without its PO returns Incomplete and does *not* burn the number, so the later complete submission is not wrongly flagged Duplicate. Order of the two files does not matter.
 
 ### Total comparison
 
@@ -135,7 +153,8 @@ The dangerous moment is the network call. Personal data never leaves your machin
 3. The **vault** (token → real value) is held in memory only, never written to disk or logs.
 4. The LLM prompt tells the model to copy placeholders unchanged and return JSON only.
 5. Real values are **restored after the model call**, inside your process, for display only.
-6. The vault is cleared when the request ends.
+6. The vault is cleared in a `finally` block when each document's pipeline ends — including when the LLM call fails.
+7. A field that comes back holding a `<BANK_n>`, `<CARD_n>` or `<IFSC_n>` placeholder is set to `null`; those values are never restored into the response.
 
 Bank account numbers are masked and dropped — the model is never asked to echo one. A trace that contains a name fails the masking criterion.
 
@@ -157,11 +176,32 @@ The console exporter prints one JSON-lines entry per stage. To use Jaeger, set `
 | Model name, prompt version | Original filenames |
 | Check status label (`duplicate=true`) | Invoice numbers as metric labels |
 
+`safe_log()` enforces this with an **allow-list**: only known-safe keys with short scalar values (or an int-valued `entity_counts` map) are written; anything else is dropped and counted in `dropped_keys`. Exception messages are never logged — only the exception class name.
+
+---
+
+## Tests
+
+```bash
+pip install pytest
+pytest -q
+```
+
+62 tests cover normalization, the duplicate store, every rule branch, LLM reply parsing, the `safe_log` allow-list, and the API end to end (with OCR/LLM faked). The API tests assert that raw PII never reaches the LLM, the vault is empty after each request, uploads are deleted on success and failure, no PII appears in logs or span attributes, and CORS only allows `localhost:8501`. They run without Presidio or an API key.
+
 ---
 
 ## Accuracy (20-document test sheet)
 
-See `data/test_sheet.csv` for ground truth. Expected accuracy numbers after running against the synthetic set:
+See `data/test_sheet.csv` for ground truth. With the API running and a real `OPENAI_API_KEY`:
+
+```bash
+python -m scripts.evaluate
+```
+
+Phase 1 sends each test-sheet file alone and scores fields + document type. Phase 2 resets the duplicate store and submits all 24 pair scenarios in order (approve, hold ₹1, hold large, duplicate first/second, bank footer, receipts, lone resubmission, lone PO). Results go to `data/eval_report.json` (match flags only, no field values). The store is reset again at the end so the demo starts clean.
+
+Targets:
 
 | Metric | Target |
 |--------|--------|
@@ -195,9 +235,11 @@ vantage-ocr/
 │       └── otel.py          # OpenTelemetry setup, safe_log
 ├── streamlit_app.py         # Streamlit UI
 ├── scripts/
-│   └── generate_samples.py  # Synthetic document generator
+│   ├── generate_samples.py  # Synthetic document generator
+│   └── evaluate.py          # Accuracy scorer against the running API
+├── tests/                   # pytest suite (no Presidio / API key needed)
 ├── data/
-│   ├── samples/             # Generated PDFs (38 files)
+│   ├── samples/             # Generated PDFs (40 files)
 │   └── test_sheet.csv       # 20-document test sheet
 ├── .env.example
 └── requirements.txt
@@ -209,8 +251,8 @@ vantage-ocr/
 
 1. **Approve** — upload `invoice_000_approve.pdf` + `po_000_approve.pdf`. Totals match → ✅ Approve.
 2. **Hold** — upload `invoice_006_hold_1rs.pdf` + `po_006_hold_1rs.pdf`. 1-rupee gap → 🟡 Hold.
-3. **Duplicate** — run Approve again with the same invoice. Second run → 🔴 Duplicate.
-4. **Bank account masking** — upload `invoice_012_bankfooter.pdf`. Bank account on footer is absent from the JSON response and absent from all trace lines.
+3. **Duplicate** — upload `invoice_012_dup_first.pdf` + `po_012_dup.pdf` (→ Approve), then `invoice_012_dup_second.pdf` + `po_012_dup.pdf`. The second prints `INV 20012` instead of `INV-20012`; normalization catches it → 🔴 Duplicate.
+4. **Bank account masking** — upload `invoice_014_bankfooter.pdf` + `po_014_bankfooter.pdf`. Bank account on footer is absent from the JSON response and absent from all trace lines.
 
 The trace panel in the UI shows four stage durations, entity counts, and masked_before_llm=true.
 
@@ -225,6 +267,11 @@ The trace panel in the UI shows four stage durations, entity counts, and masked_
 | `OPENAI_MODEL` | `gpt-4o-mini` | Model name. |
 | `OTEL_EXPORTER_OTLP_ENDPOINT` | _(console)_ | Jaeger OTLP endpoint. |
 | `MAX_UPLOAD_BYTES` | `10485760` | 10 MB cap on uploads. |
+| `LLM_TIMEOUT_S` | `30` | Per-call timeout for the LLM request. |
+| `INVOICE_DB_PATH` | `data/invoice_store.db` | SQLite duplicate store location. |
+| `VANTAGE_API_URL` | `http://localhost:8000/v1/extract` | (Streamlit) API endpoint. |
+
+To reset the duplicate store between demo runs: `python -c "from app.check.store import reset_store; reset_store()"`.
 
 The API key is read from the environment at request time. Never commit `.env`.
 

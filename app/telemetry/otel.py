@@ -28,8 +28,10 @@ _tracer: trace.Tracer | None = None
 
 
 def setup_telemetry(service_name: str = "vantage-ocr") -> None:
-    """Call once at startup."""
+    """Call once at startup. Safe to call again (no-op after the first call)."""
     global _tracer
+    if _tracer is not None:
+        return
 
     resource = Resource.create({"service.name": service_name})
     provider = TracerProvider(resource=resource)
@@ -57,6 +59,60 @@ def get_tracer() -> trace.Tracer:
 
 
 # ─── Safe structured log ───────────────────────────────────────────────────────
+#
+# Allow-list, not just deny-list: only these keys may appear in `extra`, and
+# only with scalar values (or a flat dict of str → int for entity counts).
+# Anything else is dropped and counted, so a careless caller cannot leak
+# OCR text, field values, the vault, or filenames into logs.
+
+ALLOWED_EXTRA_KEYS: frozenset[str] = frozenset({
+    "ocr_engine", "page_count", "char_count", "used_fallback", "mean_confidence",
+    "entity_counts", "placeholder_count",
+    "doc_type", "model", "prompt_version",
+    "status", "duplicate",
+    "error_class", "http_status", "file_count",
+})
+
+DENIED_KEYS: frozenset[str] = frozenset({
+    "text", "ocr_text", "masked_text", "prompt", "completion", "raw",
+    "fields", "vault", "filename", "file_name", "path",
+    "supplier_name", "invoice_number", "po_number", "invoice_date",
+    "tax_amount", "total_amount", "reason",
+})
+
+_SCALAR = (str, int, float, bool, type(None))
+
+
+def _safe_value(key: str, value):
+    if key == "entity_counts":
+        if isinstance(value, dict) and all(
+            isinstance(k, str) and isinstance(v, int) for k, v in value.items()
+        ):
+            return True, dict(value)
+        return False, None
+    if isinstance(value, _SCALAR):
+        # Guard against long free-text sneaking in through an allowed key
+        if isinstance(value, str) and len(value) > 64:
+            return False, None
+        return True, value
+    return False, None
+
+
+def sanitize_extra(extra: dict | None) -> tuple[dict, int]:
+    """Return (clean_extra, dropped_count)."""
+    clean: dict = {}
+    dropped = 0
+    for key, value in (extra or {}).items():
+        if key in DENIED_KEYS or key not in ALLOWED_EXTRA_KEYS:
+            dropped += 1
+            continue
+        ok, v = _safe_value(key, value)
+        if ok:
+            clean[key] = v
+        else:
+            dropped += 1
+    return clean, dropped
+
 
 def safe_log(
     *,
@@ -64,18 +120,21 @@ def safe_log(
     stage: str,
     duration_ms: int,
     extra: dict | None = None,
-) -> None:
+) -> dict:
     """
-    Emit one JSON-lines log entry.
-    Only safe fields are included (see telemetry deny-list in spec).
+    Emit one JSON-lines log entry containing only allow-listed fields.
+    Returns the emitted entry (handy for tests).
     """
     entry: dict = {
         "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         "level": "info",
         "request_id": request_id,
         "stage": stage,
-        "duration_ms": duration_ms,
+        "duration_ms": int(duration_ms),
     }
-    if extra:
-        entry.update(extra)
+    clean, dropped = sanitize_extra(extra)
+    entry.update(clean)
+    if dropped:
+        entry["dropped_keys"] = dropped
     print(json.dumps(entry), file=sys.stdout, flush=True)
+    return entry

@@ -11,3 +11,5 @@ build/
 data/uploads/
 data/invoice_store.db
 *.db
+data/eval_report.json
+*.db-journal
